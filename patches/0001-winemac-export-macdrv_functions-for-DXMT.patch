@@ -1,0 +1,150 @@
+diff --git a/dlls/winemac.drv/macdrv.h b/dlls/winemac.drv/macdrv.h
+index 89c498f..e82ed09 100644
+--- a/dlls/winemac.drv/macdrv.h
++++ b/dlls/winemac.drv/macdrv.h
+@@ -242,6 +242,8 @@ extern void macdrv_ime_set_text(HWND hwnd, CFStringRef text, bool complete,
+     unsigned int        per_pixel_alpha : 1;    /* is window using per-pixel alpha? */
+     unsigned int        minimized : 1;          /* is window minimized? */
+     unsigned int        fullscreen : 1;         /* is the window visible rect fullscreen? (unrelated to native AppKit/Cocoa fullscreen) */
++
++    struct client_surface *dxmt_client_surface; /* client surface created for DXMT (see macdrv_functions) */
+ };
+ 
+ struct macdrv_client_surface
+diff --git a/dlls/winemac.drv/macdrv_main.c b/dlls/winemac.drv/macdrv_main.c
+index cc3d3b3..3f1a0c6 100644
+--- a/dlls/winemac.drv/macdrv_main.c
++++ b/dlls/winemac.drv/macdrv_main.c
+@@ -629,3 +629,115 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+ C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );
+ 
+ #endif /* _WIN64 */
++
++
++/***********************************************************************
++ *              macdrv_functions
++ *
++ * Exported table used by DXMT (Direct3D 10/11 on Metal) to attach a Metal view
++ * to a window. Ported to Wine 11.x from the CrossOver hack 22435
++ * (crossover-sources-20251106), as carried by MacPorts' wine-devel.
++ * DXMT reads only the first four fields of the window data structure.
++ */
++struct dxmt_macdrv_win_data
++{
++    HWND    hwnd;
++    void   *cocoa_window;
++    void   *cocoa_view;
++    void   *client_cocoa_view;
++    struct macdrv_win_data *data;   /* the real window data, kept locked until release */
++};
++
++struct macdrv_functions_t
++{
++    void (*macdrv_init_display_devices)(BOOL);
++    struct dxmt_macdrv_win_data *(*get_win_data)(HWND hwnd);
++    void (*release_win_data)(struct dxmt_macdrv_win_data *data);
++    void *(*macdrv_get_cocoa_window)(HWND hwnd, BOOL require_on_screen);
++    void *(*macdrv_create_metal_device)(void);
++    void (*macdrv_release_metal_device)(void *d);
++    void *(*macdrv_view_create_metal_view)(void *v, void *d);
++    void *(*macdrv_view_get_metal_layer)(void *v);
++    void (*macdrv_view_release_metal_view)(void *v);
++    void *on_main_thread;
++};
++C_ASSERT(sizeof(struct macdrv_functions_t) == 80);
++
++static struct dxmt_macdrv_win_data *dxmt_get_win_data(HWND hwnd)
++{
++    struct macdrv_win_data *data;
++    struct dxmt_macdrv_win_data *dxmt_data;
++
++    TRACE("get_win_data %p\n", hwnd);
++
++    if (!(data = get_win_data(hwnd))) return NULL;
++
++    if (!data->client_view && !data->dxmt_client_surface)
++        data->dxmt_client_surface = macdrv_CreateClientSurface(hwnd, 0, FALSE);
++
++    if (!(dxmt_data = calloc(1, sizeof(*dxmt_data))))
++    {
++        release_win_data(data);
++        return NULL;
++    }
++    dxmt_data->hwnd = hwnd;
++    dxmt_data->cocoa_window = (void *)data->cocoa_window;
++    dxmt_data->cocoa_view = (void *)data->client_view;
++    dxmt_data->client_cocoa_view = (void *)data->client_view;
++    dxmt_data->data = data;
++    return dxmt_data;
++}
++
++static void dxmt_release_win_data(struct dxmt_macdrv_win_data *dxmt_data)
++{
++    TRACE("release_win_data %p\n", dxmt_data);
++
++    if (!dxmt_data) return;
++    release_win_data(dxmt_data->data);
++    free(dxmt_data);
++}
++
++static void *dxmt_get_cocoa_window(HWND hwnd, BOOL require_on_screen)
++{
++    return (void *)macdrv_get_cocoa_window(hwnd, require_on_screen);
++}
++
++static void *dxmt_create_metal_device(void)
++{
++    return (void *)macdrv_create_metal_device();
++}
++
++static void dxmt_release_metal_device(void *d)
++{
++    macdrv_release_metal_device((MTLDevice_id)d);
++}
++
++static void *dxmt_view_create_metal_view(void *v, void *d)
++{
++    TRACE("create_metal_view %p %p\n", v, d);
++    return (void *)macdrv_view_create_metal_view((WineContentView *)v, (MTLDevice_id)d);
++}
++
++static void *dxmt_view_get_metal_layer(void *v)
++{
++    return (void *)macdrv_view_get_metal_layer((WineMetalView *)v);
++}
++
++static void dxmt_view_release_metal_view(void *v)
++{
++    macdrv_view_release_metal_view((WineMetalView *)v);
++}
++
++DECLSPEC_EXPORT struct macdrv_functions_t macdrv_functions =
++{
++    NULL,
++    dxmt_get_win_data,
++    dxmt_release_win_data,
++    dxmt_get_cocoa_window,
++    dxmt_create_metal_device,
++    dxmt_release_metal_device,
++    dxmt_view_create_metal_view,
++    dxmt_view_get_metal_layer,
++    dxmt_view_release_metal_view,
++    NULL
++};
+diff --git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
+index 552971f..6ea09c1 100644
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -1267,6 +1267,12 @@ void macdrv_DestroyWindow(HWND hwnd)
+ 
+     destroy_cocoa_window(data);
+ 
++    if (data->dxmt_client_surface)
++    {
++        client_surface_release(data->dxmt_client_surface);
++        data->dxmt_client_surface = NULL;
++    }
++
+     CFDictionaryRemoveValue(win_datas, hwnd);
+     release_win_data(data);
+     free(data);
