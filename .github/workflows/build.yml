@@ -1,0 +1,87 @@
+name: Build winemac.so with DXMT exports
+
+# Builds Wine's macOS window driver (winemac.so) from the official Wine source
+# plus one small patch, so DXMT (Direct3D 10/11 on Metal) can attach to windows.
+# Runs on an Intel Mac: our Wine is an x86_64 build that runs on Apple Silicon through Rosetta 2.
+
+on:
+  workflow_dispatch:
+    inputs:
+      wine_version:
+        description: "Wine version (git tag without the 'wine-' prefix)"
+        default: "11.21"
+        required: true
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    env:
+      WINE_VERSION: ${{ github.event.inputs.wine_version || '11.21' }}
+      MACOSX_DEPLOYMENT_TARGET: "10.15"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          brew update
+          brew install bison mingw-w64 pkgconf freetype gnutls sdl2 molten-vk
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+
+      - name: Download Wine source
+        run: |
+          curl -fsSL -o wine.tar.gz "https://github.com/wine-mirror/wine/archive/refs/tags/wine-${WINE_VERSION}.tar.gz"
+          tar -xzf wine.tar.gz
+          mv "wine-wine-${WINE_VERSION}" wine
+
+      - name: Apply patches
+        working-directory: wine
+        run: |
+          for p in ../patches/*.patch; do
+            echo "Applying $p"
+            patch -p1 --forward < "$p"
+          done
+
+      - name: Configure
+        working-directory: wine
+        run: |
+          ./configure \
+            --enable-archs=i386,x86_64 \
+            --disable-tests \
+            --disable-winebth_sys \
+            --without-alsa --without-capi --with-coreaudio --without-dbus \
+            --without-ffmpeg --without-fontconfig --with-freetype --with-gnutls \
+            --without-gphoto --without-gssapi --without-gstreamer --without-inotify \
+            --without-krb5 --without-netapi --with-opencl --without-opengl --without-oss \
+            --with-pcap --with-pthread --without-pulse --without-sane --with-sdl \
+            --without-udev --without-usb --without-v4l2 --with-vulkan --without-wayland --without-x
+
+      - name: Build winemac.so
+        working-directory: wine
+        run: |
+          make -j"$(sysctl -n hw.ncpu)" dlls/winemac.drv/winemac.so || make -j"$(sysctl -n hw.ncpu)"
+
+      - name: Check the result
+        working-directory: wine
+        run: |
+          f=dlls/winemac.drv/winemac.so
+          file "$f"
+          otool -L "$f"
+          nm -gU "$f"
+          nm -gU "$f" | grep -q "_macdrv_functions" || { echo "macdrv_functions is NOT exported"; exit 1; }
+          echo "OK: macdrv_functions is exported"
+
+      - name: Pack
+        run: |
+          mkdir -p out
+          cp wine/dlls/winemac.drv/winemac.so out/
+          cp patches/*.patch out/
+          echo "Wine ${WINE_VERSION} + patches in this repository, built $(date -u +%Y-%m-%dT%H:%MZ) on ${{ runner.os }} ${{ runner.arch }}" > out/BUILD-INFO.txt
+          shasum -a 256 out/winemac.so >> out/BUILD-INFO.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: winemac-dxmt-wine-${{ env.WINE_VERSION }}
+          path: out/
